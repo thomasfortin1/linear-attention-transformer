@@ -224,7 +224,7 @@ class FeedForward(nn.Module):
 # self attention layer
 
 def linear_attn(q, k, v, kv_mask = None, use_mup=False):
-    dim = q.shape[-1] * q.shape[1]
+    dim = q.shape[-1] 
 
     if exists(kv_mask):
         mask_value = max_neg_value(q)
@@ -237,7 +237,7 @@ def linear_attn(q, k, v, kv_mask = None, use_mup=False):
     k = k.softmax(dim=-2)
 
     if use_mup:
-        q = q * dim ** -1
+        q = q * (dim * 64) ** -1
     else:
         q = q * dim ** -0.5
 
