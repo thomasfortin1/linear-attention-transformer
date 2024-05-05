@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+from torch.nn.init import constant_
 from torch import nn, einsum
 import math
 from operator import mul
@@ -15,6 +16,8 @@ from axial_positional_embedding import AxialPositionalEmbedding
 from linear_attention_transformer.reversible import ReversibleSequence, SequentialSequence
 
 from einops import rearrange, repeat
+
+from mup import MuReadout, MuSharedReadout
 
 # namedtuple settings
 
@@ -62,6 +65,12 @@ def split_at_index(dim, index, t):
 
 def max_neg_value(tensor):
     return -torch.finfo(tensor.dtype).max
+
+def init_method_normal(sigma):
+    """Init method based on N(0, sigma)."""
+    def init_(tensor):
+        return nn.init.normal_(tensor, mean=0.0, std=sigma)
+    return init_
 
 # helper classes
 
@@ -177,7 +186,7 @@ class GELU_(nn.Module):
 GELU = nn.GELU if hasattr(nn, 'GELU') else GELU_
 
 class FeedForward(nn.Module):
-    def __init__(self, dim, mult = 4, dropout = 0., activation = None, glu = False):
+    def __init__(self, dim, encoder_var=1, mult = 4, dropout = 0., activation = None, glu = False, output_mult = 1, use_mup=False):
         super().__init__()
         activation = default(activation, GELU)
 
@@ -186,6 +195,19 @@ class FeedForward(nn.Module):
         self.act = activation()
         self.dropout = nn.Dropout(dropout)
         self.w2 = nn.Linear(dim * mult, dim)
+        if use_mup:
+            self.init_method_1 = init_method_normal((encoder_var/dim) ** .5)
+            self.init_method_2 = init_method_normal((encoder_var/dim/mult) ** .5)
+            self.reset_parameters()
+
+    def reset_parameters(self):
+        self.init_method_1(self.w1.weight)
+        self.init_method_2(self.w2.weight)
+        constant_(self.w1.bias, 0.)
+        constant_(self.w2.bias, 0.)
+        
+        # self.w2.bias.data.zero_()                 
+        self.w2.weight.data.zero_()
 
     def forward(self, x, **kwargs):
         if not self.glu:
@@ -201,8 +223,8 @@ class FeedForward(nn.Module):
 
 # self attention layer
 
-def linear_attn(q, k, v, kv_mask = None):
-    dim = q.shape[-1]
+def linear_attn(q, k, v, kv_mask = None, use_mup=False):
+    dim = q.shape[-1] * q.shape[1]
 
     if exists(kv_mask):
         mask_value = max_neg_value(q)
@@ -214,13 +236,17 @@ def linear_attn(q, k, v, kv_mask = None):
     q = q.softmax(dim=-1)
     k = k.softmax(dim=-2)
 
-    q = q * dim ** -0.5
+    if use_mup:
+        q = q * dim ** -1
+    else:
+        q = q * dim ** -0.5
 
     context = einsum('bhnd,bhne->bhde', k, v)
     attn = einsum('bhnd,bhde->bhne', q, context)
     return attn.reshape(*q.shape)
 
-def causal_linear_attn(q, k, v, kv_mask = None, bucket_size = None, eps = 1e-3):
+
+def causal_linear_attn(q, k, v, kv_mask = None, bucket_size = None, eps = 1e-3, use_mup=False):
     b, h, n, e, dtype = *q.shape, q.dtype
     bucket_size = default(bucket_size, 64)
     bucket_size = max(bucket_size, 1)
@@ -229,7 +255,10 @@ def causal_linear_attn(q, k, v, kv_mask = None, bucket_size = None, eps = 1e-3):
     q = q.softmax(dim=-1)
     k = torch.exp(k).type(dtype).clone()
 
-    q = q * e ** -0.5
+    if use_mup:
+        q = q * e ** -1
+    else:
+        q = q * e ** -0.5
 
     if exists(kv_mask):
         mask = kv_mask[:, None, :, None]
@@ -257,8 +286,9 @@ def causal_linear_attn(q, k, v, kv_mask = None, bucket_size = None, eps = 1e-3):
     attn = einsum('bhund,bhude,bhun->bhune', b_q, context, D_inv)
     return attn.reshape(*q.shape)
 
+
 class SelfAttention(nn.Module):
-    def __init__(self, dim, heads, causal = False, dim_head = None, blindspot_size = 1, n_local_attn_heads = 0, local_attn_window_size = 128, receives_context = False, dropout = 0., attn_dropout = 0.):
+    def __init__(self, dim, heads, encoder_var = 1, causal = False, dim_head = None, blindspot_size = 1, n_local_attn_heads = 0, local_attn_window_size = 128, receives_context = False, dropout = 0., attn_dropout = 0., use_mup=False):
         super().__init__()
         assert dim_head or (dim % heads) == 0, 'embedding dimension must be divisible by number of heads'
         d_heads = default(dim_head, dim // heads)
@@ -283,6 +313,29 @@ class SelfAttention(nn.Module):
 
         self.to_out = nn.Linear(d_heads * heads, dim)
         self.dropout = nn.Dropout(dropout)
+
+        self.use_mup = use_mup
+
+        # add fanin initialization
+        if self.use_mup:
+            self.init_method = init_method_normal((encoder_var/dim) ** .5)
+            self.init_method_out = init_method_normal((encoder_var/d_heads/heads) ** .5)
+            self.reset_parameters()
+
+    def reset_parameters(self):
+        self.init_method(self.to_q.weight)
+        self.init_method(self.to_k.weight)
+        self.init_method(self.to_v.weight)
+        self.init_method_out(self.to_out.weight)
+
+        # constant_(self.to_out.bias, 0.) Have to not do this otherwise coord check is bad
+        # bias is set to false for q, k, and v
+
+        # zero initialize key head
+        # constant_(self.to_k.weight, 0.)
+
+        # zero initialize query head
+        # constant_(self.to_q.weight, 0.)
 
     def forward(self, x, input_mask = None, context = None, context_mask = None, pos_emb = None, **kwargs):
         assert not (self.receives_context and not exists(context)), 'context must be supplied if self attention is in receives context mode'
@@ -310,12 +363,14 @@ class SelfAttention(nn.Module):
         has_local, has_global = map(lambda x: x.shape[1] > 0, (lq, q))
 
         if has_local:
+            print("ALERT *********** We have local attention!!!")
             local_out = self.local_attn(lq, lk, lv, input_mask = input_mask)
             out.append(local_out)
 
         if has_global:
             kv_mask = input_mask if not self.receives_context else context_mask
-            global_out = self.global_attn_fn(q, k, v, kv_mask = kv_mask)
+            global_out = self.global_attn_fn(q, k, v, kv_mask = kv_mask, use_mup=self.use_mup)
+            # global_out = self.local_attn(lq, lk, lv, input_mask = input_mask)
             out.append(global_out)
 
         attn = torch.cat(out, dim=1)
@@ -347,6 +402,7 @@ class LinearAttentionTransformer(nn.Module):
         dim,
         depth,
         max_seq_len,
+        encoder_var = 1,
         heads = 8,
         dim_head = None,
         bucket_size = 64,
@@ -366,12 +422,16 @@ class LinearAttentionTransformer(nn.Module):
         pkm_num_keys = 128,
         linformer_settings = None,
         context_linformer_settings = None,
-        shift_tokens = False
+        shift_tokens = False,
+        output_mult = 1,
+        use_mup = False
     ):
         super().__init__()
         assert not (causal and exists(linformer_settings)), 'Linformer self attention layer can only be used for non-causal networks'
         assert not exists(linformer_settings) or isinstance(linformer_settings, LinformerSettings), 'Linformer self-attention settings must be a LinformerSettings namedtuple'
         assert not exists(context_linformer_settings) or isinstance(context_linformer_settings, LinformerContextSettings), 'Linformer contextual self-attention settings must be a LinformerSettings namedtuple'
+        assert not (use_mup and (exists(linformer_settings) or exists(context_linformer_settings))), 'MUP cannot be used with Linformer self-attention layers'
+        assert not (use_mup and n_local_attn_heads != 0) , 'MUP cannot be used with local attention heads'
 
         if type(n_local_attn_heads) is not tuple:
             n_local_attn_heads = tuple([n_local_attn_heads] * depth)
@@ -385,10 +445,10 @@ class LinearAttentionTransformer(nn.Module):
             layer_num = ind + 1
             use_pkm = layer_num in cast_tuple(pkm_layers)
 
-            parallel_net = Chunk(ff_chunks, FeedForward(dim), along_dim = 1) if not use_pkm else PKM(dim)
+            parallel_net = Chunk(ff_chunks, FeedForward(dim, encoder_var=encoder_var, output_mult=output_mult, use_mup=use_mup), along_dim = 1) if not use_pkm else PKM(dim)
 
             if not exists(linformer_settings):
-                attn = SelfAttention(dim, heads, causal, dim_head = dim_head, blindspot_size = blindspot_size, n_local_attn_heads = local_heads, local_attn_window_size = local_attn_window_size, dropout = attn_layer_dropout, attn_dropout= attn_dropout)
+                attn = SelfAttention(dim, heads, causal=causal, encoder_var=encoder_var, dim_head = dim_head, blindspot_size = blindspot_size, n_local_attn_heads = local_heads, local_attn_window_size = local_attn_window_size, dropout = attn_layer_dropout, attn_dropout= attn_dropout, use_mup=use_mup)
             else:
                 attn = LinformerSelfAttention(dim, max_seq_len, heads = heads, dim_head = dim_head, dropout = attn_dropout, **linformer_settings._asdict())
 
@@ -403,13 +463,13 @@ class LinearAttentionTransformer(nn.Module):
 
             if attend_axially:
                 layers.append(nn.ModuleList([
-                    PreNorm(dim, FoldAxially(local_attn_window_size, SelfAttention(dim, heads, causal, dropout = attn_layer_dropout, attn_dropout= attn_dropout))),
-                    PreNorm(dim, Chunk(ff_chunks, FeedForward(dim, glu = ff_glu, dropout= ff_dropout), along_dim = 1))
+                    PreNorm(dim, FoldAxially(local_attn_window_size, SelfAttention(dim, heads, causal, dropout = attn_layer_dropout, attn_dropout= attn_dropout, use_mup=use_mup))),
+                    PreNorm(dim, Chunk(ff_chunks, FeedForward(dim, glu = ff_glu, dropout= ff_dropout), along_dim = 1, use_mup=use_mup))
                 ]))
 
             if receives_context:
                 if not exists(context_linformer_settings):
-                    attn = SelfAttention(dim, heads, dim_head = dim_head, dropout = attn_layer_dropout, attn_dropout= attn_dropout, receives_context = True)
+                    attn = SelfAttention(dim, heads, dim_head = dim_head, dropout = attn_layer_dropout, attn_dropout= attn_dropout, receives_context = True, use_mup=use_mup)
                 else:
                     attn = LinformerSelfAttention(dim, heads = heads, dim_head = dim_head, dropout = attn_dropout, **context_linformer_settings._asdict())
 
